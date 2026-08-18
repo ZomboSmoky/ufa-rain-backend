@@ -6,7 +6,7 @@ import requests
 import json
 import os
 
-# Глобальное хранилище в оперативной памяти для кэширования прогноза
+# Глобальный кэш прогноза в памяти
 CACHED_FORECAST = []
 
 WEIGHTS_FILE = "weights.json"
@@ -55,12 +55,12 @@ def update_weights_based_on_reality(weights, last_forecasts, real_rain_fact):
     return new_weights
 
 def update_weather_data():
-    """Фоновая функция: выполняется строго 1 раз в час, обновляя глобальный кэш"""
+    """Фоновая функция обновления: запуск строго раз в 1 час"""
     global CACHED_FORECAST
     weights = load_weights()
     updated_forecast = []
     
-    # 1. Получаем факт осадков
+    # 1. Получаем факт осадков на метеостанции Уфы за текущий час
     test_lat, test_lon = 54.739, 55.975
     archive_url = f"https://open-meteo.com{test_lat}&longitude={test_lon}&current=precipitation&timezone=auto"
     real_rain_fact = 0
@@ -71,37 +71,56 @@ def update_weather_data():
     except Exception:
         pass
 
-    # 2. Опрашиваем модели для каждого района Уфы
+    # 2. Опрашиваем прогностические модели по районам города
     for district in OFFICIAL_DISTRICTS:
-        # Теперь мы запрашиваем параметр &current=... для КАЖДОЙ модели индивидуально!
-        # Сервер Open-Meteo сам сопоставит разные временные сетки (1ч и 3ч) и вернет готовые точечные цифры!
+        # ЗАПРОС ИСПРАВЛЕН: ищем в блоке hourly, но выравниваем время флагом &models=...
         url = (
             f"https://open-meteo.com?"
             f"latitude={district['lat']}&longitude={district['lon']}&"
-            f"current=precipitation_probability,precipitation_probability_gfs,"
-            f"precipitation_probability_icon,precipitation_probability_arome,"
-            f"precipitation_probability_jma&timezone=auto"
+            f"current=time&"
+            f"hourly=precipitation_probability&"
+            f"models=ecmwf_ifs,gfs_seamless,icon_seamless,meteofrance_arome,jma_seamless&"
+            f"forecast_days=1&timezone=auto"
         )
         
         try:
             res = requests.get(url, timeout=6)
             if res.status_code == 200:
-                current_data = res.json().get("current", {})
+                data = res.json()
                 
-                # Забираем чистые скалярные значения (больше никаких массивов и индексов времени!)
+                # Узнаем точное текущее время в Уфе по версии сервера погоды
+                current_time_str = data.get("current", {}).get("time") # Пример: "2026-08-18T15:00"
+                hourly_data = data.get("hourly", {})
+                time_list = hourly_data.get("time", [])
+                
+                # Находим индекс текущего часа
+                try:
+                    idx = time_list.index(current_time_str)
+                except ValueError:
+                    idx = 0
+                
+                # Безопасно достаем проценты вероятностей из выровненных часовых массивов моделей
+                def extract_prob(model_key):
+                    arr = hourly_data.get(model_key, [])
+                    if idx < len(arr) and arr[idx] is not None:
+                        return int(arr[idx])
+                    return 0
+
                 probs = {
-                    "ecmwf": current_data.get("precipitation_probability", 0) or 0,
-                    "gfs": current_data.get("precipitation_probability_gfs", 0) or 0,
-                    "icon": current_data.get("precipitation_probability_icon", 0) or 0,
-                    "arome": current_data.get("precipitation_probability_arome", 0) or 0,
-                    "jma": current_data.get("precipitation_probability_jma", 0) or 0,
+                    "ecmwf": extract_prob("precipitation_probability_ecmwf_ifs"),
+                    "gfs": extract_prob("precipitation_probability_gfs_seamless"),
+                    "icon": extract_prob("precipitation_probability_icon_seamless"),
+                    "arome": extract_prob("precipitation_probability_meteofrance_arome"),
+                    "jma": extract_prob("precipitation_probability_jma_seamless"),
                 }
+                # Норвежская Yr.no
                 probs["yr_no"] = int((probs["ecmwf"] + probs["icon"]) / 2)
                 
-                # Математический расчет ансамбля по весам
+                # Вычисляем финальный ансамбль по весам
                 final_prob = sum(weights[model] * probs[model] for model in MODELS_LIST)
                 final_prob = min(max(int(final_prob), 0), 100)
                 
+                # Обучаем веса на основе центральной точки
                 if district["id"] == "sovetskiy":
                     weights = update_weights_based_on_reality(weights, probs, real_rain_fact)
                     save_weights(weights)
@@ -135,24 +154,21 @@ def update_weather_data():
             "sources_raw": sources_display
         })
         
-    # Записываем результат в глобальный кэш, если он не пустой
     if updated_forecast:
         CACHED_FORECAST = updated_forecast
 
-# Управление жизненным циклом FastAPI (запуск планировщика)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Запускаем первичный расчет при старте сервера, чтобы кэш сразу заполнился данными
+    # Запускаем первичный расчет данных сразу при старте контейнера
     update_weather_data()
-    
-    # Настраиваем планировщик на запуск функции каждые 60 минут (1 час)
+    # Запускаем фоновый планировщик на обновление раз в 60 минут
     scheduler = BackgroundScheduler()
     scheduler.add_job(update_weather_data, 'interval', minutes=60)
     scheduler.start()
     yield
     scheduler.shutdown()
 
-app = FastAPI(title="Ufa Rain Radar API — Cached Scheduler v1", lifespan=lifespan)
+app = FastAPI(title="Ufa Rain Radar API — Final Stable v2", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -164,8 +180,6 @@ app.add_middleware(
 
 @app.get("/api/v1/forecast")
 def get_forecast():
-    # Эндпоинт больше не ходит в интернет, он мгновенно отдает кэшированные данные
     if not CACHED_FORECAST:
-        # Страховочный вызов, если кэш пуст
         update_weather_data()
     return CACHED_FORECAST
