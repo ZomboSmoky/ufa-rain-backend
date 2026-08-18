@@ -7,6 +7,11 @@ from pydantic import BaseModel
 
 app = FastAPI(title="Ufa Rain Radar API")
 
+# ТЕСТОВЫЙ ПУТЬ: Если сервер работает, по чистой ссылке (без хвостиков) он выдаст этот текст
+@app.get("/")
+async def root():
+    return {"status": "working", "message": "Сервер Уфы запущен и отвечает!"}
+
 DISTRICTS = {
     "chernikovka": {"name": "Черниковка", "modifier": 1.05},
     "sipalovo": {"name": "Сипайлово", "modifier": 1.10},
@@ -26,20 +31,18 @@ class ForecastResponse(BaseModel):
 async def get_rain_forecast():
     results = []
     for d_id, d_info in DISTRICTS.items():
-        # Симуляция опроса Яндекс, AccuWeather и Apple
         p_yandex = random.uniform(0.1, 0.9)  
         p_accu = random.uniform(0.1, 0.9)
         p_apple = random.uniform(0.1, 0.9)
         
-        # Ансамблирование (объединение данных)
         p_final = (0.5 * p_yandex + 0.3 * p_accu + 0.2 * p_apple) * d_info["modifier"]
         p_final = min(max(p_final, 0.0), 1.0)
         prob = round(p_final * 100, 1)
         
         if prob > 70:
-            rec = "Ливень практически неизбежен. Возьмите зонт и избегайте низин."
+            rec = "Ливень практически неизбежен. Возьмите зонт."
         elif prob > 40:
-            rec = "Возможен локальный дождь. Проверьте радар перед выходом."
+            rec = "Возможен локальный дождь. Проверьте радар."
         else:
             rec = "Прогноз благоприятный, существенных осадков не ожидается."
             
@@ -54,4 +57,4 @@ async def get_rain_forecast():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
