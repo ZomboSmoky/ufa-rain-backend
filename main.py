@@ -1,18 +1,13 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from apscheduler.schedulers.background import BackgroundScheduler
+from contextlib import asynccontextmanager
 import requests
 import json
 import os
 
-app = FastAPI(title="Ufa Rain Radar API — Timezone Fixed")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Глобальное хранилище в оперативной памяти для кэширования прогноза
+CACHED_FORECAST = []
 
 WEIGHTS_FILE = "weights.json"
 LEARNING_RATE = 0.05
@@ -59,12 +54,13 @@ def update_weights_based_on_reality(weights, last_forecasts, real_rain_fact):
         new_weights[model] /= total
     return new_weights
 
-@app.get("/api/v1/forecast")
-def get_forecast():
+def update_weather_data():
+    """Фоновая функция: выполняется строго 1 раз в час, обновляя глобальный кэш"""
+    global CACHED_FORECAST
     weights = load_weights()
-    forecast = []
+    updated_forecast = []
     
-    # 1. Запрашиваем факт осадков за текущий момент
+    # 1. Получаем факт осадков
     test_lat, test_lon = 54.739, 55.975
     archive_url = f"https://open-meteo.com{test_lat}&longitude={test_lon}&current=precipitation&timezone=auto"
     real_rain_fact = 0
@@ -75,54 +71,34 @@ def get_forecast():
     except Exception:
         pass
 
-    # 2. Опрашиваем прогностические модели
+    # 2. Опрашиваем модели для каждого района Уфы
     for district in OFFICIAL_DISTRICTS:
-        # Добавляем в запрос параметр &current=time, чтобы API само сказало, какой сейчас час в Уфе
+        # Теперь мы запрашиваем параметр &current=... для КАЖДОЙ модели индивидуально!
+        # Сервер Open-Meteo сам сопоставит разные временные сетки (1ч и 3ч) и вернет готовые точечные цифры!
         url = (
             f"https://open-meteo.com?"
             f"latitude={district['lat']}&longitude={district['lon']}&"
-            f"current=time&"
-            f"hourly=precipitation_probability,precipitation_probability_gfs,"
+            f"current=precipitation_probability,precipitation_probability_gfs,"
             f"precipitation_probability_icon,precipitation_probability_arome,"
-            f"precipitation_probability_jma&"
-            f"forecast_days=1&timezone=auto"
+            f"precipitation_probability_jma&timezone=auto"
         )
         
         try:
-            res = requests.get(url, timeout=5)
+            res = requests.get(url, timeout=6)
             if res.status_code == 200:
-                data = res.json()
+                current_data = res.json().get("current", {})
                 
-                # Находим точную временную метку текущего часа в Уфе, выданную сервером погоды
-                current_time_str = data.get("current", {}).get("time") # Формат: "2026-08-18T15:00"
-                hourly_time_list = data.get("hourly", {}).get("time", [])
-                
-                # Находим индекс этого часа внутри прогностического массива
-                try:
-                    idx = hourly_time_list.index(current_time_str)
-                except ValueError:
-                    idx = 0 # Резервный срез, если точное совпадение не найдено
-                
-                hourly_data = data.get("hourly", {})
-                
-                # Безопасно извлекаем данные по индексу, страхуясь от None
-                def get_val(arr):
-                    if idx < len(arr) and arr[idx] is not None:
-                        return int(arr[idx])
-                    return 0
-
+                # Забираем чистые скалярные значения (больше никаких массивов и индексов времени!)
                 probs = {
-                    "ecmwf": get_val(hourly_data.get("precipitation_probability", [])),
-                    "gfs": get_val(hourly_data.get("precipitation_probability_gfs", [])),
-                    "icon": get_val(hourly_data.get("precipitation_probability_icon", [])),
-                    "arome": get_val(hourly_data.get("precipitation_probability_arome", [])),
-                    "jma": get_val(hourly_data.get("precipitation_probability_jma", [])),
+                    "ecmwf": current_data.get("precipitation_probability", 0) or 0,
+                    "gfs": current_data.get("precipitation_probability_gfs", 0) or 0,
+                    "icon": current_data.get("precipitation_probability_icon", 0) or 0,
+                    "arome": current_data.get("precipitation_probability_arome", 0) or 0,
+                    "jma": current_data.get("precipitation_probability_jma", 0) or 0,
                 }
-                
-                # Норвежский ансамбль Yr.no
                 probs["yr_no"] = int((probs["ecmwf"] + probs["icon"]) / 2)
                 
-                # Математический расчет финальной взвешенной вероятности
+                # Математический расчет ансамбля по весам
                 final_prob = sum(weights[model] * probs[model] for model in MODELS_LIST)
                 final_prob = min(max(int(final_prob), 0), 100)
                 
@@ -137,9 +113,9 @@ def get_forecast():
             final_prob = 0
 
         if final_prob > 70:
-            rec = "⚠️ Самообучающийся ансамбль зафиксировал критический риск осадков. Ливень крайне вероятен."
+            rec = "⚠️ Математический ансамбль зафиксировал критический риск осадков. Ливень крайне вероятен."
         elif final_prob > 40:
-            rec = "🌧️ Повышенная вероятность локальных дождей. Веса моделей скорректированы по фактической точности."
+            rec = "🌧️ Повышенная вероятность локальных дождей. Веса моделей скорректированы по фактической точности за прошлый час."
         else:
             rec = "☀️ Математический консенсус моделей гарантирует сухую погоду."
             
@@ -151,7 +127,7 @@ def get_forecast():
             }[m]
             sources_display[ru_name] = f"Прогноз: {probs[m]}% (Текущий вес источника в ансамбле: {round(weights[m]*100, 1)}%)"
 
-        forecast.append({
+        updated_forecast.append({
             "district_id": district["id"],
             "district_name": district["name"],
             "rain_probability_percent": final_prob,
@@ -159,4 +135,37 @@ def get_forecast():
             "sources_raw": sources_display
         })
         
-    return forecast
+    # Записываем результат в глобальный кэш, если он не пустой
+    if updated_forecast:
+        CACHED_FORECAST = updated_forecast
+
+# Управление жизненным циклом FastAPI (запуск планировщика)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Запускаем первичный расчет при старте сервера, чтобы кэш сразу заполнился данными
+    update_weather_data()
+    
+    # Настраиваем планировщик на запуск функции каждые 60 минут (1 час)
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(update_weather_data, 'interval', minutes=60)
+    scheduler.start()
+    yield
+    scheduler.shutdown()
+
+app = FastAPI(title="Ufa Rain Radar API — Cached Scheduler v1", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/api/v1/forecast")
+def get_forecast():
+    # Эндпоинт больше не ходит в интернет, он мгновенно отдает кэшированные данные
+    if not CACHED_FORECAST:
+        # Страховочный вызов, если кэш пуст
+        update_weather_data()
+    return CACHED_FORECAST
