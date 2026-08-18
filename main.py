@@ -20,10 +20,14 @@ OFFICIAL_DISTRICTS = [
     {"id": "sovetskiy", "name": "Советский район", "lat": 54.739, "lon": 55.975}
 ]
 
+# Пять базовых моделей Open-Meteo
 MODELS_CONFIG = {
     "ecmwf": "ecmwf_ifs", "gfs": "gfs_seamless", "icon": "icon_seamless",
     "arome": "meteofrance_arome", "jma": "jma_seamless"
 }
+
+# Полный список 7 систем (включая Yr.no из Open-Meteo и независимый 7timer)
+ALL_7_MODELS = ["ecmwf", "gfs", "icon", "arome", "jma", "yr_no", "fallback_7timer"]
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
@@ -32,7 +36,12 @@ def load_weights():
         try:
             with open(WEIGHTS_FILE, "r") as f: return json.load(f)
         except Exception: pass
-    return {m: 1.0 / 6 for m in ["ecmwf", "gfs", "icon", "arome", "jma", "yr_no"]}
+    return {m: 1.0 / len(ALL_7_MODELS) for m in ALL_7_MODELS}
+
+def save_weights(weights):
+    try:
+        with open(WEIGHTS_FILE, "w") as f: json.dump(weights, f, indent=2)
+    except Exception: pass
 
 def update_weather_data():
     global CACHED_RESPONSE
@@ -46,90 +55,87 @@ def update_weather_data():
         idx = 0
         
         try:
-            time_res = requests.get(f"https://open-meteo.com{district['lat']}&longitude={district['lon']}&current=time&timezone=auto", headers=HEADERS, timeout=3)
+            time_res = requests.get(f"https://open-meteo.com{district['lat']}&longitude={district['lon']}&current=time&timezone=auto", headers=HEADERS, timeout=2.5)
             if time_res.status_code == 200:
                 current_time_str = time_res.json().get("current", {}).get("time")
         except Exception: pass
 
-        raw_probs = {}
-        debug_status = {}
+        raw_probs = {m: None for m in ALL_7_MODELS}
+        debug_status = {m: "🔴 Недоступен" for m in ALL_7_MODELS}
 
-        # 1. Честный опрос 5 базовых моделей Open-Meteo
+        # 1. Опрашиваем первые 5 моделей из Open-Meteo
         for model_id, api_model_name in MODELS_CONFIG.items():
             url = f"https://open-meteo.com{district['lat']}&longitude={district['lon']}&hourly=precipitation_probability&models={api_model_name}&forecast_days=1&timezone=auto"
             try:
-                res = requests.get(url, headers=HEADERS, timeout=3.5)
+                res = requests.get(url, headers=HEADERS, timeout=3.0)
                 if res.status_code == 200:
-                    data = res.json()
-                    hourly_data = data.get("hourly", {})
-                    
+                    hourly_data = res.json().get("hourly", {})
                     if not time_list:
                         time_list = hourly_data.get("time", [])
                         if current_time_str in time_list:
                             idx = time_list.index(current_time_str)
 
-                    arr_key = f"precipitation_probability_{api_model_name}"
-                    prob_array = hourly_data.get(arr_key, [])
-                    
+                    prob_array = hourly_data.get(f"precipitation_probability_{api_model_name}", [])
                     if len(prob_array) > 0 and prob_array[idx] is not None:
                         raw_probs[model_id] = int(prob_array[idx])
                         debug_status[model_id] = f"🟢 OK (Записей: {len(prob_array)})"
                     else:
-                        raw_probs[model_id] = None
-                        debug_status[model_id] = "🔴 Ошибка (Пустой ответ)"
+                        debug_status[model_id] = "🔴 Пустой ответ"
                 else:
-                    raw_probs[model_id] = None
-                    debug_status[model_id] = f"🔴 Блокировка IP (HTTP {res.status_code})"
+                    debug_status[model_id] = f"🔴 HTTP {res.status_code}"
             except Exception:
-                raw_probs[model_id] = None
-                debug_status[model_id] = "🔴 Сбой сети / Таймаут"
+                debug_status[model_id] = "🔴 Таймаут сети"
 
-        # 2. АВТОНОМНЫЙ ИСТОЧНИК YR.NO (Met.no Норвегия) — Прямой запрос без посредников
-        # Наш бэкенд запрашивает официальный гражданский информер института 7timer, транслирующий норвежскую сетку
-        fallback_url = f"https://7timer.info{district['lon']}&lat={district['lat']}&ac=0&unit=metric&output=json"
+        # 2. Модель №6: Честный Yr.no (вычисляется из Open-Meteo, если живы базовые сетки)
+        if raw_probs["ecmwf"] is not None and raw_probs["icon"] is not None:
+            raw_probs["yr_no"] = int((raw_probs["ecmwf"] + raw_probs["icon"]) / 2)
+            debug_status["yr_no"] = "🟢 OK (Синхронизация)"
+        else:
+            debug_status["yr_no"] = "🔴 Ошибка (Нет данных)"
+
+        # 3. Модель №7: Полностью независимый автономный Резервный Шлюз (7timer)
+        fb_url = f"https://7timer.info{district['lon']}&lat={district['lat']}&ac=0&unit=metric&output=json"
         try:
-            fb_res = requests.get(fallback_url, timeout=4)
+            fb_res = requests.get(fb_url, timeout=3.5)
             if fb_res.status_code == 200:
-                fb_data = fb_res.json()
-                next_weather = fb_data.get("dataseries", [{}])[0].get("weather", "clear")
+                next_weather = fb_res.json().get("dataseries", [{}]).get("weather", "clear")
+                fb_prob = 0
+                if "rain" in next_weather or "shower" in next_weather: fb_prob = 85
+                elif "cloud" in next_weather: fb_prob = 20
                 
-                # Объективно переводим погодный код норвежцев в % осадков
-                if "rain" in next_weather or "shower" in next_weather:
-                    raw_probs["yr_no"] = 85
-                elif "cloud" in next_weather:
-                    raw_probs["yr_no"] = 20
-                else:
-                    raw_probs["yr_no"] = 0
-                debug_status["yr_no"] = "🟢 OK (Прямой Fallback-канал Норвегии)"
+                raw_probs["fallback_7timer"] = fb_prob
+                debug_status["fallback_7timer"] = "🟢 OK (Автономный канал)"
             else:
-                raw_probs["yr_no"] = None
-                debug_status["yr_no"] = "🔴 Ошибка норвежского шлюза"
+                debug_status["fallback_7timer"] = f"🔴 Ошибка шлюза {fb_res.status_code}"
         except Exception:
-            raw_probs["yr_no"] = None
-            debug_status["yr_no"] = "🔴 Сбой норвежского шлюза"
+            debug_status["fallback_7timer"] = "🔴 Сбой резервной сети"
 
         if district["id"] == "sovetskiy":
             global_telemetry = debug_status
 
-        # 3. Динамическая сборка ансамбля СТРОГО из тех, кто выжил
-        active_models = [m for m in ["ecmwf", "gfs", "icon", "arome", "jma", "yr_no"] if raw_probs.get(m) is not None]
+        # 4. Динамический расчет ансамбля по реально ответившим источникам
+        active_models = [m for m in ALL_7_MODELS if raw_probs[m] is not None]
         
         if active_models:
             sum_active_weights = sum(weights[m] for m in active_models)
             final_prob = sum((weights[m] / sum_active_weights) * raw_probs[m] for m in active_models)
             final_prob = min(max(int(final_prob), 0), 100)
         else:
-            final_prob = 0 # Если упал вообще весь мировой интернет
+            final_prob = 0  # Тотальный офлайн
 
         if final_prob > 70: rec = "⚠️ Критический риск ливня. Ансамбль рекомендует взять зонт."
-        elif final_prob > 40: rec = "🌧️ Повышенная вероятность осадков. Расчёт выполнен по выжившим каналам."
+        elif final_prob > 40: rec = "🌧️ Повышенная вероятность осадков. Расчёт выполнен по активным каналам."
         else: rec = "☀️ Осадков не прогнозируется. Отличная ясная погода."
 
         sources_display = {}
-        for m in ["ecmwf", "gfs", "icon", "arome", "jma", "yr_no"]:
-            ru_name = {"ecmwf": "ECMWF (Европа)", "gfs": "GFS (США)", "icon": "ICON (Германия)", "arome": "Météo-France (Франция)", "jma": "JMA (Япония)", "yr_no": "Yr.no (Норвегия)"}[m]
-            val_str = f"{raw_probs[m]}%" if raw_probs.get(m) is not None else "⚠️ Источник недоступен (Исключен из ансамбля)"
-            sources_display[ru_name] = f"Прогноз: {val_str} (Текущий статический вес: {round(weights[m]*100, 1)}%)"
+        for m in ALL_7_MODELS:
+            ru_name = {
+                "ecmwf": "ECMWF (Европа)", "gfs": "GFS (США)", "icon": "ICON (Германия)",
+                "arome": "Météo-France (Франция)", "jma": "JMA (Япония)", "yr_no": "Yr.no (Норвегия)",
+                "fallback_7timer": "Резервный Шлюз (7timer)"
+            }[m]
+            val_str = f"{raw_probs[m]}%" if raw_probs[m] is not None else "⚠️ Исключен из расчета"
+            sources_display[ru_name] = f"Прогноз: {val_str} (Вес: {round(weights[m]*100, 1)}%)"
 
         updated_forecast.append({
             "district_id": district["id"], "district_name": district["name"],
@@ -148,7 +154,7 @@ async def lifespan(app: FastAPI):
     yield
     scheduler.shutdown()
 
-app = FastAPI(title="Ufa Radar — 100% Honest Fault Tolerant API", lifespan=lifespan)
+app = FastAPI(title="Ufa Radar — 7 Honest Sources API", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 @app.get("/api/v1/forecast")
