@@ -6,6 +6,7 @@ import requests
 import json
 import os
 
+# Глобальный кэш прогноза в памяти
 CACHED_FORECAST = []
 WEIGHTS_FILE = "weights.json"
 LEARNING_RATE = 0.05
@@ -20,7 +21,6 @@ OFFICIAL_DISTRICTS = [
     {"id": "sovetskiy", "name": "Советский район", "lat": 54.739, "lon": 55.975}
 ]
 
-# Возвращаем полный список 6 моделей
 MODELS_LIST = ["ecmwf", "gfs", "icon", "arome", "jma", "yr_no"]
 
 def load_weights():
@@ -33,22 +33,24 @@ def load_weights():
     return {model: 1.0 / len(MODELS_LIST) for model in MODELS_LIST}
 
 def save_weights(weights):
-    with open(WEIGHTS_FILE, "w") as f:
-        json.dump(weights, f, indent=2)
+    try:
+        with open(WEIGHTS_FILE, "w") as f:
+            json.dump(weights, f, indent=2)
+    except Exception:
+        pass
 
 def update_weights_based_on_reality(weights, last_forecasts, real_rain_fact, active_models):
-    """Корректировка весов только для тех моделей, которые успешно отдали данные"""
+    """Безопасный пересчет весов только для реально ответивших моделей"""
     new_weights = weights.copy()
     total = 0.0
     target = 100.0 if real_rain_fact > 0 else 0.0
     
     for model in MODELS_LIST:
-        if model in active_models:
-            pred = last_forecasts.get(model, 0.0)
+        if model in active_models and model in last_forecasts:
+            pred = last_forecasts[model]
             error = abs(pred - target) / 100.0
             new_weights[model] = weights[model] * (1.0 - LEARNING_RATE * error)
         else:
-            # Если модель спала, её вес не штрафуется и не поощряется
             new_weights[model] = weights[model]
             
         if new_weights[model] < 0.02:
@@ -60,11 +62,12 @@ def update_weights_based_on_reality(weights, last_forecasts, real_rain_fact, act
     return new_weights
 
 def update_weather_data():
+    """Фоновая функция: собирает метеоданные и пишет в кэш"""
     global CACHED_FORECAST
     weights = load_weights()
     updated_forecast = []
     
-    # 1. Получаем факт осадков за текущий час в Центре
+    # 1. Получаем факт осадков
     test_lat, test_lon = 54.739, 55.975
     archive_url = f"https://open-meteo.com{test_lat}&longitude={test_lon}&current=precipitation&timezone=auto"
     real_rain_fact = 0
@@ -77,7 +80,6 @@ def update_weather_data():
 
     # 2. Опрашиваем прогностические модели
     for district in OFFICIAL_DISTRICTS:
-        # Запрашиваем абсолютно все доступные модели
         url = (
             f"https://open-meteo.com?"
             f"latitude={district['lat']}&longitude={district['lon']}&"
@@ -100,7 +102,6 @@ def update_weather_data():
                 except ValueError:
                     idx = 0
                 
-                # Изолированная функция извлечения: возвращает число ИЛИ None (если данных нет)
                 def safe_extract(model_key):
                     arr = hourly_data.get(model_key, [])
                     if idx < len(arr) and arr[idx] is not None:
@@ -115,13 +116,11 @@ def update_weather_data():
                     "jma": safe_extract("precipitation_probability_jma_seamless")
                 }
                 
-                # Симуляция Yr.no (работает, если живы базовые ecmwf и icon)
                 if raw_probs["ecmwf"] is not None and raw_probs["icon"] is not None:
                     raw_probs["yr_no"] = int((raw_probs["ecmwf"] + raw_probs["icon"]) / 2)
                 else:
                     raw_probs["yr_no"] = None
 
-                # Отсекаем "упавшие" модели и формируем список активных
                 active_probs = {}
                 active_models = []
                 for m in MODELS_LIST:
@@ -130,10 +129,7 @@ def update_weather_data():
                         active_models.append(m)
                 
                 if active_models:
-                    # Динамическая нормализация весов только для активных моделей!
-                    # Делаем так, чтобы сумма весов работающих моделей в этот миг была равна 1.0
                     sum_active_weights = sum(weights[m] for m in active_models)
-                    
                     final_prob = 0.0
                     for m in active_models:
                         normalized_weight = weights[m] / sum_active_weights
@@ -141,7 +137,6 @@ def update_weather_data():
                         
                     final_prob = min(max(int(final_prob), 0), 100)
                     
-                    # Обучаем веса на основе выживших моделей
                     if district["id"] == "sovetskiy":
                         weights = update_weights_based_on_reality(weights, active_probs, real_rain_fact, active_models)
                         save_weights(weights)
@@ -186,6 +181,7 @@ def update_weather_data():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Первичный синхронный вызов при старте
     update_weather_data()
     scheduler = BackgroundScheduler()
     scheduler.add_job(update_weather_data, 'interval', minutes=60)
@@ -193,7 +189,7 @@ async def lifespan(app: FastAPI):
     yield
     scheduler.shutdown()
 
-app = FastAPI(title="Ufa Rain Radar API — Fault Tolerant 6 Models", lifespan=lifespan)
+app = FastAPI(title="Ufa Rain Radar API — Ultimate Fault Tolerant", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -205,6 +201,7 @@ app.add_middleware(
 
 @app.get("/api/v1/forecast")
 def get_forecast():
+    # Если фоновый планировщик еще не успел отработать, запускаем его принудительно прямо в запросе
     if not CACHED_FORECAST:
         update_weather_data()
     return CACHED_FORECAST
