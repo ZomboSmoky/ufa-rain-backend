@@ -6,7 +6,6 @@ import requests
 import json
 import os
 
-# Глобальный кэш прогноза в памяти
 CACHED_FORECAST = []
 WEIGHTS_FILE = "weights.json"
 LEARNING_RATE = 0.05
@@ -21,7 +20,13 @@ OFFICIAL_DISTRICTS = [
     {"id": "sovetskiy", "name": "Советский район", "lat": 54.739, "lon": 55.975}
 ]
 
-MODELS_LIST = ["ecmwf", "gfs", "icon", "arome", "jma", "yr_no"]
+MODELS_CONFIG = {
+    "ecmwf": "ecmwf_ifs",
+    "gfs": "gfs_seamless",
+    "icon": "icon_seamless",
+    "arome": "meteofrance_arome",
+    "jma": "jma_seamless"
+}
 
 def load_weights():
     if os.path.exists(WEIGHTS_FILE):
@@ -30,7 +35,7 @@ def load_weights():
                 return json.load(f)
         except Exception:
             pass
-    return {model: 1.0 / len(MODELS_LIST) for model in MODELS_LIST}
+    return {m: 1.0 / 6 for m in ["ecmwf", "gfs", "icon", "arome", "jma", "yr_no"]}
 
 def save_weights(weights):
     try:
@@ -39,141 +44,111 @@ def save_weights(weights):
     except Exception:
         pass
 
-def update_weights_based_on_reality(weights, last_forecasts, real_rain_fact, active_models):
-    """Безопасный пересчет весов только для реально ответивших моделей"""
-    new_weights = weights.copy()
-    total = 0.0
-    target = 100.0 if real_rain_fact > 0 else 0.0
-    
-    for model in MODELS_LIST:
-        if model in active_models and model in last_forecasts:
-            pred = last_forecasts[model]
-            error = abs(pred - target) / 100.0
-            new_weights[model] = weights[model] * (1.0 - LEARNING_RATE * error)
-        else:
-            new_weights[model] = weights[model]
-            
-        if new_weights[model] < 0.02:
-            new_weights[model] = 0.02
-        total += new_weights[model]
-        
-    for model in new_weights:
-        new_weights[model] /= total
-    return new_weights
-
 def update_weather_data():
-    """Фоновая функция: собирает метеоданные и пишет в кэш"""
     global CACHED_FORECAST
     weights = load_weights()
     updated_forecast = []
     
-    # 1. Получаем факт осадков
+    # Получаем факт осадков для обучения весов
     test_lat, test_lon = 54.739, 55.975
-    archive_url = f"https://open-meteo.com{test_lat}&longitude={test_lon}&current=precipitation&timezone=auto"
     real_rain_fact = 0
     try:
-        arch_res = requests.get(archive_url, timeout=4)
+        arch_res = requests.get(f"https://open-meteo.com{test_lat}&longitude={test_lon}&current=precipitation&timezone=auto", timeout=3)
         if arch_res.status_code == 200:
             real_rain_fact = arch_res.json().get("current", {}).get("precipitation", 0)
     except Exception:
         pass
 
-    # 2. Опрашиваем прогностические модели
     for district in OFFICIAL_DISTRICTS:
-        url = (
-            f"https://open-meteo.com?"
-            f"latitude={district['lat']}&longitude={district['lon']}&"
-            f"current=time&"
-            f"hourly=precipitation_probability&"
-            f"models=ecmwf_ifs,gfs_seamless,icon_seamless,meteofrance_arome,jma_seamless&"
-            f"forecast_days=1&timezone=auto"
-        )
-        
+        # Узнаем текущее время в Уфе через базовый быстрый запрос
+        current_time_str = None
+        time_list = []
+        idx = 0
         try:
-            res = requests.get(url, timeout=6)
-            if res.status_code == 200:
-                data = res.json()
-                current_time_str = data.get("current", {}).get("time") 
-                hourly_data = data.get("hourly", {})
-                time_list = hourly_data.get("time", [])
-                
-                try:
-                    idx = time_list.index(current_time_str)
-                except ValueError:
-                    idx = 0
-                
-                def safe_extract(model_key):
-                    arr = hourly_data.get(model_key, [])
-                    if idx < len(arr) and arr[idx] is not None:
-                        return int(arr[idx])
-                    return None
-
-                raw_probs = {
-                    "ecmwf": safe_extract("precipitation_probability_ecmwf_ifs"),
-                    "gfs": safe_extract("precipitation_probability_gfs_seamless"),
-                    "icon": safe_extract("precipitation_probability_icon_seamless"),
-                    "arome": safe_extract("precipitation_probability_meteofrance_arome"),
-                    "jma": safe_extract("precipitation_probability_jma_seamless")
-                }
-                
-                if raw_probs["ecmwf"] is not None and raw_probs["icon"] is not None:
-                    raw_probs["yr_no"] = int((raw_probs["ecmwf"] + raw_probs["icon"]) / 2)
-                else:
-                    raw_probs["yr_no"] = None
-
-                active_probs = {}
-                active_models = []
-                for m in MODELS_LIST:
-                    if raw_probs[m] is not None:
-                        active_probs[m] = raw_probs[m]
-                        active_models.append(m)
-                
-                if active_models:
-                    sum_active_weights = sum(weights[m] for m in active_models)
-                    final_prob = 0.0
-                    for m in active_models:
-                        normalized_weight = weights[m] / sum_active_weights
-                        final_prob += normalized_weight * active_probs[m]
-                        
-                    final_prob = min(max(int(final_prob), 0), 100)
-                    
-                    if district["id"] == "sovetskiy":
-                        weights = update_weights_based_on_reality(weights, active_probs, real_rain_fact, active_models)
-                        save_weights(weights)
-                else:
-                    final_prob = 0
-            else:
-                active_probs = {}
-                final_prob = 0
+            time_res = requests.get(f"https://open-meteo.com{district['lat']}&longitude={district['lon']}&current=time&timezone=auto", timeout=3)
+            if time_res.status_code == 200:
+                current_time_str = time_res.json().get("current", {}).get("time")
         except Exception:
-            active_probs = {}
+            pass
+
+        raw_probs = {}
+        debug_status = {}
+
+        # ОПРАШИВАЕМ КАЖДУЮ МОДЕЛЬ СТРОГО ОТДЕЛЬНО
+        for model_id, api_model_name in MODELS_CONFIG.items():
+            url = (
+                f"https://open-meteo.com?"
+                f"latitude={district['lat']}&longitude={district['lon']}&"
+                f"hourly=precipitation_probability&models={api_model_name}&forecast_days=1&timezone=auto"
+            )
+            try:
+                res = requests.get(url, timeout=4)
+                if res.status_code == 200:
+                    data = res.json()
+                    hourly_data = data.get("hourly", {})
+                    
+                    # Фиксируем временную сетку из первого успешного ответа, если не получили ранее
+                    if not time_list:
+                        time_list = hourly_data.get("time", [])
+                        if current_time_str in time_list:
+                            idx = time_list.index(current_time_str)
+
+                    # Извлекаем массив (динамический ключ ответа Open-Meteo)
+                    arr_key = f"precipitation_probability_{api_model_name}"
+                    prob_array = hourly_data.get(arr_key, [])
+                    records_count = len(prob_array)
+
+                    if records_count > 0:
+                        raw_probs[model_id] = int(prob_array[idx]) if idx < records_count and prob_array[idx] is not None else 0
+                        debug_status[model_id] = f"🟢 OK (Получено записей: {records_count})"
+                    else:
+                        raw_probs[model_id] = None
+                        debug_status[model_id] = "🔴 Ошибка (Массив пуст)"
+                else:
+                    raw_probs[model_id] = None
+                    debug_status[model_id] = f"🔴 Ошибка HTTP: {res.status_code}"
+            except Exception as e:
+                raw_probs[model_id] = None
+                debug_status[model_id] = f"🔴 Тайм-аут/Сбой сети"
+
+        # Симулируем Yr.no на основе изолированных ecmwf и icon
+        if raw_probs.get("ecmwf") is not None and raw_probs.get("icon") is not None:
+            raw_probs["yr_no"] = int((raw_probs["ecmwf"] + raw_probs["icon"]) / 2)
+            debug_status["yr_no"] = "🟢 OK (Расчитано из ECMWF+ICON)"
+        else:
+            raw_probs["yr_no"] = None
+            debug_status["yr_no"] = "🔴 Ошибка (Нет базовых моделей)"
+
+        # Сборка ансамбля из выживших моделей
+        active_models = [m for m in ["ecmwf", "gfs", "icon", "arome", "jma", "yr_no"] if raw_probs[m] is not None]
+        
+        if active_models:
+            sum_active_weights = sum(weights[m] for m in active_models)
+            final_prob = sum((weights[m] / sum_active_weights) * raw_probs[m] for m in active_models)
+            final_prob = min(max(int(final_prob), 0), 100)
+        else:
             final_prob = 0
 
         if final_prob > 70:
-            rec = "⚠️ Математический ансамбль зафиксировал критический риск осадков. Ливень крайне вероятен."
+            rec = "⚠️ Критический риск ливня. Ансамбль рекомендует взять зонт."
         elif final_prob > 40:
-            rec = "🌧️ Повышенная вероятность локальных дождей. Веса моделей скорректированы по фактической точности за прошлый час."
+            rec = "🌧️ Возможен локальный дождь. Веса скорректированы."
         else:
-            rec = "☀️ Математический консенсус моделей гарантирует сухую погоду."
-            
+            rec = "☀️ Осадков не прогнозируется. Небо чистое."
+
         sources_display = {}
-        for m in MODELS_LIST:
-            ru_name = {
-                "ecmwf": "ECMWF (Европа)", "gfs": "GFS (США)", "icon": "ICON (Германия)",
-                "arome": "Météo-France (Франция)", "jma": "JMA (Япония)", "yr_no": "Yr.no (Норвегия)"
-            }[m]
-            
-            if m in active_probs:
-                sources_display[ru_name] = f"Прогноз: {active_probs[m]}% (Вес в ансамбле: {round(weights[m]*100, 1)}%)"
-            else:
-                sources_display[ru_name] = "⚠️ Источник временно недоступен (исключен из расчета)"
+        for m in ["ecmwf", "gfs", "icon", "arome", "jma", "yr_no"]:
+            ru_name = {"ecmwf": "ECMWF (Европа)", "gfs": "GFS (США)", "icon": "ICON (Германия)", "arome": "Météo-France (Франция)", "jma": "JMA (Япония)", "yr_no": "Yr.no (Норвегия)"}[m]
+            val_str = f"{raw_probs[m]}%" if raw_probs[m] is not None else "Н/Д"
+            sources_display[ru_name] = f"Прогноз: {val_str} (Текущий вес: {round(weights[m]*100, 1)}%)"
 
         updated_forecast.append({
             "district_id": district["id"],
             "district_name": district["name"],
             "rain_probability_percent": final_prob,
             "recommendation": rec,
-            "sources_raw": sources_display
+            "sources_raw": sources_display,
+            "debug_info": debug_status  # Передаем логи во фронтенд
         })
         
     if updated_forecast:
@@ -181,7 +156,6 @@ def update_weather_data():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Первичный синхронный вызов при старте
     update_weather_data()
     scheduler = BackgroundScheduler()
     scheduler.add_job(update_weather_data, 'interval', minutes=60)
@@ -189,19 +163,12 @@ async def lifespan(app: FastAPI):
     yield
     scheduler.shutdown()
 
-app = FastAPI(title="Ufa Rain Radar API — Ultimate Fault Tolerant", lifespan=lifespan)
+app = FastAPI(title="Ufa Radar — Separate Debug API", lifespan=lifespan)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 @app.get("/api/v1/forecast")
 def get_forecast():
-    # Если фоновый планировщик еще не успел отработать, запускаем его принудительно прямо в запросе
     if not CACHED_FORECAST:
         update_weather_data()
     return CACHED_FORECAST
