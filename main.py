@@ -3,9 +3,8 @@ from fastapi.middleware.cors import CORSMiddleware
 import requests
 import json
 import os
-from datetime import datetime
 
-app = FastAPI(title="Ufa Rain Radar API — Fixed Live Analytics")
+app = FastAPI(title="Ufa Rain Radar API — Timezone Fixed")
 
 app.add_middleware(
     CORSMiddleware,
@@ -65,7 +64,7 @@ def get_forecast():
     weights = load_weights()
     forecast = []
     
-    # 1. Запрашиваем факт осадков за прошлый час (текущий срез)
+    # 1. Запрашиваем факт осадков за текущий момент
     test_lat, test_lon = 54.739, 55.975
     archive_url = f"https://open-meteo.com{test_lat}&longitude={test_lon}&current=precipitation&timezone=auto"
     real_rain_fact = 0
@@ -76,14 +75,13 @@ def get_forecast():
     except Exception:
         pass
 
-    # Вычисляем текущий индекс часа (от 0 до 23) на основе локального времени
-    current_hour = datetime.now().hour
-
     # 2. Опрашиваем прогностические модели
     for district in OFFICIAL_DISTRICTS:
+        # Добавляем в запрос параметр &current=time, чтобы API само сказало, какой сейчас час в Уфе
         url = (
             f"https://open-meteo.com?"
             f"latitude={district['lat']}&longitude={district['lon']}&"
+            f"current=time&"
             f"hourly=precipitation_probability,precipitation_probability_gfs,"
             f"precipitation_probability_icon,precipitation_probability_arome,"
             f"precipitation_probability_jma&"
@@ -94,29 +92,37 @@ def get_forecast():
             res = requests.get(url, timeout=5)
             if res.status_code == 200:
                 data = res.json()
+                
+                # Находим точную временную метку текущего часа в Уфе, выданную сервером погоды
+                current_time_str = data.get("current", {}).get("time") # Формат: "2026-08-18T15:00"
+                hourly_time_list = data.get("hourly", {}).get("time", [])
+                
+                # Находим индекс этого часа внутри прогностического массива
+                try:
+                    idx = hourly_time_list.index(current_time_str)
+                except ValueError:
+                    idx = 0 # Резервный срез, если точное совпадение не найдено
+                
                 hourly_data = data.get("hourly", {})
                 
-                # Защита: проверяем, что индекс часа не выходит за рамки массива ответа
-                idx = current_hour if current_hour < len(hourly_data.get("precipitation_probability", [])) else 0
-                
-                # Достаем точечное число процента строго на текущий час
-                ecmwf_arr = hourly_data.get("precipitation_probability", [])
-                gfs_arr = hourly_data.get("precipitation_probability_gfs", [])
-                icon_arr = hourly_data.get("precipitation_probability_icon", [])
-                arome_arr = hourly_data.get("precipitation_probability_arome", [])
-                jma_arr = hourly_data.get("precipitation_probability_jma", [])
-                
+                # Безопасно извлекаем данные по индексу, страхуясь от None
+                def get_val(arr):
+                    if idx < len(arr) and arr[idx] is not None:
+                        return int(arr[idx])
+                    return 0
+
                 probs = {
-                    "ecmwf": ecmwf_arr[idx] if idx < len(ecmwf_arr) else 0,
-                    "gfs": gfs_arr[idx] if idx < len(gfs_arr) else 0,
-                    "icon": icon_arr[idx] if idx < len(icon_arr) else 0,
-                    "arome": arome_arr[idx] if idx < len(arome_arr) else 0,
-                    "jma": jma_arr[idx] if idx < len(jma_arr) else 0,
+                    "ecmwf": get_val(hourly_data.get("precipitation_probability", [])),
+                    "gfs": get_val(hourly_data.get("precipitation_probability_gfs", [])),
+                    "icon": get_val(hourly_data.get("precipitation_probability_icon", [])),
+                    "arome": get_val(hourly_data.get("precipitation_probability_arome", [])),
+                    "jma": get_val(hourly_data.get("precipitation_probability_jma", [])),
                 }
-                # Симулируем норвежскую модель Yr.no
+                
+                # Норвежский ансамбль Yr.no
                 probs["yr_no"] = int((probs["ecmwf"] + probs["icon"]) / 2)
                 
-                # Считаем итоговую взвешенную вероятность
+                # Математический расчет финальной взвешенной вероятности
                 final_prob = sum(weights[model] * probs[model] for model in MODELS_LIST)
                 final_prob = min(max(int(final_prob), 0), 100)
                 
